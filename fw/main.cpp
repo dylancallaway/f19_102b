@@ -1,5 +1,7 @@
 #include "mbed.h"
 
+typedef void (*f_t)(); // function pointer typedef
+
 // Serial
 Serial pc(USBTX, USBRX, 115200);
 
@@ -10,78 +12,54 @@ Thread heartbeat_thread(osPriorityLow, 256);
 void heartbeat_fcn();
 
 // Encoders
-static int8_t enc_lookup_table[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 // white is +3.3/5V
 // black is gnd
-// Encoder 1
-InterruptIn enc_1_a(PB_14); // green OPPOSITE M2
-InterruptIn enc_1_b(PB_13); // blue OPPOSITE M2
+static int8_t enc_lookup_table[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
+InterruptIn enc[2][2] = {{PB_14, PB_13},  // encoder 0
+                         {PA_11, PB_12}}; // encoder 1
+void enc_0_isr();
 void enc_1_isr();
-// Encoder 2
-InterruptIn enc_2_a(PA_11); // blue OPPOSITE M1
-InterruptIn enc_2_b(PB_12); // green OPPOSITE M1
-void enc_2_isr();
+f_t enc_isr_ptr[2] = {&enc_0_isr, &enc_1_isr};
 volatile int64_t enc_count[2] = {0, 0};
 
 // Motors
 // Motor 1
-// Short wire side
-DigitalOut mot_1_dir(D3);
+DigitalOut mot_dir[2] = {D3, D5};
 PwmOut mot_pwm[2] = {D4, D6};
-DigitalOut mot_2_dir(D5);
-// PwmOut mot_pwm[1](D6);
 
 // Controllers
 // gains bro
 #define Kp .002f
 #define Ki .00001f
 #define Kd .05f
-// Controller 1 (for motor 1)
-Ticker controller_1_ticker;
 void controller_0_fcn();
-int64_t motor_1_set = 0;
-// Controller 2 (for motor 2)
-Ticker controller_2_ticker;
 void controller_1_fcn();
-int64_t motor_2_set = 0;
+f_t controller_fcn[2] = {&controller_0_fcn, &controller_1_fcn};
+Ticker controller_0_ticker, controller_1_ticker;
+Ticker controller_ticker[2] = {controller_0_ticker, controller_1_ticker};
+int64_t motor_set[2] = {0, 0};
 
 // global flags
-bool moving_1 = false;
-bool moving_2 = false;
+bool moving[2] = {false, false};
 
 int main()
 {
-    // Encoder 1 init
-    enc_1_a.rise(&enc_1_isr);
-    enc_1_a.fall(&enc_1_isr);
-    enc_1_b.rise(&enc_1_isr);
-    enc_1_b.fall(&enc_1_isr);
-    // Encoder 2 init
-    enc_2_a.rise(&enc_2_isr);
-    enc_2_a.fall(&enc_2_isr);
-    enc_2_b.rise(&enc_2_isr);
-    enc_2_b.fall(&enc_2_isr);
+    for (uint8_t m = 0; m < 2; m++) // iterate through motors
+    {
+        mot_dir[m].write(0);
+        mot_pwm[m].period_us(25); // 40 kHz
+        mot_pwm[m].write(0.0f);
+        controller_ticker[m].attach_us(controller_fcn[m], 1000);
+        for (uint8_t p = 0; p < 2; p++) // iterate through encoder pins
+        {
+            // attach interrupts to all motors+pins on rise and fall
+            enc[m][p].rise(enc_isr_ptr[m]);
+            enc[m][p].fall(enc_isr_ptr[m]);
+        }
+    }
+    heartbeat_thread.start(heartbeat_fcn); // start heartbeat after succesful inits
 
-    // Motor 1 init
-    // mot_1_dir = 0 is M1A direction
-    mot_1_dir.write(0);
-    mot_pwm[0].period_us(25); // 40 kHz
-    mot_pwm[0].write(.0f);
-    // Motor 2 init
-    // mot_2_dir = 0 is M2A direction
-    mot_2_dir.write(0);
-    mot_pwm[1].period_us(25); // 40 kHz
-    mot_pwm[1].write(.0f);
-
-    // Controller 1
-    controller_1_ticker.attach_us(&controller_0_fcn, 1000);
-    // Controller 2
-    controller_2_ticker.attach_us(&controller_1_fcn, 1000);
-
-    // Heartbeat init after other inits
-    heartbeat_thread.start(heartbeat_fcn);
-
-    // Status LEDs off
+    // init with status LEDs off
     grn_led.write(0);
     red_led.write(0);
 
@@ -90,19 +68,20 @@ int main()
     // action arrays
     uint8_t num_actions = 2;
     int32_t action_delay[num_actions] = {3000, 1000};
-    int64_t motor_1_position[num_actions] = {2000, 12000};
-    int64_t motor_2_position[num_actions] = {10000, 12000};
+    int64_t motor_position[2][num_actions] = {{1000, 3000},  // motor 0
+                                              {2000, 3000}}; // motor 1
 
     //action loop
     for (int i = 0; i < num_actions; i++)
     {
-        motor_1_set = motor_1_position[i];
-        motor_2_set = motor_2_position[i];
-        moving_1 = true;
-        moving_2 = true;
-        while (moving_1 == true || moving_2 == true)
+        for (uint8_t m = 0; m < 2; m++)
         {
-            ThisThread::sleep_for(10);
+            motor_set[m] = motor_position[m][i];
+            moving[m] = true;
+        }
+        while (moving[0] == true || moving[1] == true)
+        {
+            ThisThread::sleep_for(100);
         }
         ThisThread::sleep_for(action_delay[i]);
     }
@@ -110,7 +89,9 @@ int main()
     // Infinite loop
     while (true)
     {
-        ThisThread::sleep_for(500);
+        heartbeat_thread.terminate();
+        grn_led.write(!grn_led);
+        ThisThread::sleep_for(100); // TODO change this to recall heartbeat_fcn with different blink time
     }
 }
 
@@ -124,7 +105,7 @@ void controller_0_fcn()
     // Apply control signal at start of fcn call
     mot_pwm[0].write(abs(out));
 
-    err = motor_1_set - enc_count[0];
+    err = motor_set[0] - enc_count[0];
 
     out = Kp * err; // Proportional (this resets out to a new value, so it does not sum infinitely)
 
@@ -144,11 +125,11 @@ void controller_0_fcn()
     out += Kd * (err - last_err); // Derivative
     last_err = err;               // Update last_error to be current err for next loop
 
-    mot_1_dir.write(out / abs(out) == -1); // OPPOSITE TO M2
+    mot_dir[0].write(out / abs(out) == -1); // OPPOSITE TO M2
 
     if (err >= -1 && err <= 1)
     {
-        moving_1 = false;
+        moving[0] = false;
         out = 0;
     }
 }
@@ -163,7 +144,7 @@ void controller_1_fcn()
     // Apply control signal at start of fcn call
     mot_pwm[1].write(abs(out));
 
-    err = motor_2_set - enc_count[1];
+    err = motor_set[1] - enc_count[1];
 
     out = Kp * err; // Proportional (this resets out to a new value, so it does not sum infinitely)
 
@@ -183,26 +164,26 @@ void controller_1_fcn()
     out += Kd * (err - last_err); // Derivative
     last_err = err;               // Update last_error to be current err for next loop
 
-    mot_2_dir.write(out / abs(out) == 1); // OPPOSITE TO M1
+    mot_dir[1].write(out / abs(out) == 1); // OPPOSITE TO M1
 
     if (err >= -1 && err <= 1)
     {
-        moving_2 = false;
+        moving[1] = false;
         out = 0;
     }
+}
+
+void enc_0_isr()
+{
+    static uint8_t enc_val = 0;
+    enc_val = (enc_val << 2) | ((enc[0][0].read() << 1) | enc[0][1].read());
+    enc_count[0] += enc_lookup_table[enc_val & 0b1111];
 }
 
 void enc_1_isr()
 {
     static uint8_t enc_val = 0;
-    enc_val = (enc_val << 2) | ((enc_1_a.read() << 1) | enc_1_b.read());
-    enc_count[0] += enc_lookup_table[enc_val & 0b1111];
-}
-
-void enc_2_isr()
-{
-    static uint8_t enc_val = 0;
-    enc_val = (enc_val << 2) | ((enc_2_a.read() << 1) | enc_2_b.read());
+    enc_val = (enc_val << 2) | ((enc[1][0].read() << 1) | enc[1][1].read());
     enc_count[1] += enc_lookup_table[enc_val & 0b1111];
 }
 
